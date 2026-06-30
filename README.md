@@ -1,4 +1,4 @@
-# 🔍 file-search-mcp
+# 🔍 mcp-filesearch
 
 A cross-platform MCP server for searching your files by name, content, extension, or modification time - directly from chat. 
 
