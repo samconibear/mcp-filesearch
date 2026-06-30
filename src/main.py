@@ -4,8 +4,6 @@ File search MCP server
 Lets a client search a designated root directory by filename pattern,
 content (grep-style), file extension, or modification time, plus get
 basic metadata. All operations are scoped to ROOT_DIR.
-
-Run with: python main.py /the/directory/you/want/searched
 """
 
 import sys
