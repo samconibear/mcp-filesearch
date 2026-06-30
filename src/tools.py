@@ -1,56 +1,21 @@
-"""
-File search MCP server — zero third-party dependencies, cross-platform.
-
-Lets a client search a designated root directory by filename pattern,
-content (grep-style), file extension, or modification time, plus get
-basic metadata. All operations are scoped to ROOT_DIR — paths are
-resolved and checked to prevent escaping it via "../" traversal.
-
-Run with: python3 file_search_mcp_server.py /path/to/your/directory
-(defaults to the current working directory if no argument given)
-"""
-
 import fnmatch
-import os
-import sys
 import time
-from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
-mcp = FastMCP("file-search-server")
+import fs
 
-ROOT_DIR = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else Path.cwd().resolve()
-
-if not ROOT_DIR.is_dir():
-    print(f"Error: {ROOT_DIR} is not a directory", file=sys.stderr)
-    sys.exit(1)
-
-# Directories to skip during walks — version control internals, dependency
-# trees, and build outputs that are rarely what someone is searching for
-_SKIP_DIRS = {
-    ".git", "node_modules", "dist", "build", ".next", ".nuxt", ".idea",
-    "__pycache__", ".venv", ".env", "site-packages", "*.egg-info",
-    "target", ".gradle", ".mvn", ".build", ".terraform", "cdk.out", ".DS_Store",
-}
-# Hard cap on results returned in one call, to avoid flooding the model's
-# context with thousands of matches from a broad pattern
-_MAX_RESULTS = 200
-
-
-def _resolve_within_root(relative_path: str) -> Path | None:
-    candidate = (ROOT_DIR / relative_path).resolve()
-    if ROOT_DIR not in candidate.parents and candidate != ROOT_DIR:
-        return None
-    return candidate
-
-
-def _iter_files():
-    for dirpath, dirnames, filenames in os.walk(ROOT_DIR):
-        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
-        for name in filenames:
-            yield Path(dirpath) / name
-
+mcp = FastMCP(
+    "file-search",
+    instructions=(
+        "Provides direct access to files on the user's local filesystem, scoped to one "
+        "root directory. Use these tools any time the user references 'my files', 'my "
+        "project', 'this directory', 'my notes', a specific filename, or asks what's in "
+        "a folder - instead of asking the user to paste file contents into chat, or "
+        "guessing about file contents, call the appropriate tool directly. "
+        "Prefer these tools over asking the user to describe their files manually."
+    ),
+)
 
 @mcp.tool()
 def find_by_name(pattern: str, case_sensitive: bool = False) -> list[dict]:
@@ -61,17 +26,18 @@ def find_by_name(pattern: str, case_sensitive: bool = False) -> list[dict]:
     Accepts glob syntax: '*' for any characters, '?' for one character.
     Examples: 'config.*' matches config.json/config.yaml; 'test_*.py' matches test_main.py.
     If the user is asking for "all .py files" or "all markdown files" with no other
-    qualifier, prefer find_by_extension instead — it's the more direct match for that phrasing."""  
+    qualifier, prefer find_by_extension instead — it's the more direct match for that phrasing.
+    """
     matches = []
     match_pattern = pattern if case_sensitive else pattern.lower()
-    for path in _iter_files():
+    for path in fs.iter_files():
         name = path.name if case_sensitive else path.name.lower()
         if fnmatch.fnmatch(name, match_pattern):
             matches.append({
-                "path": str(path.relative_to(ROOT_DIR)),
+                "path": str(path.relative_to(fs.ROOT_DIR)),
                 "size_bytes": path.stat().st_size,
             })
-            if len(matches) >= _MAX_RESULTS:
+            if len(matches) >= fs.MAX_RESULTS:
                 break
     return matches
 
@@ -99,7 +65,7 @@ def search_content(
 ) -> list[dict]:
     """
     Search INSIDE files for a piece of text (not filenames — use find_by_name/find_by_extension
-    for that. Use this when the user wants to know which files mention or contain something,
+    for that). Use this when the user wants to know which files mention or contain something,
     e.g. "which files mention TODO", "find where the function 'connect' is defined",
     "search my notes for 'budget'". Returns matching lines with line numbers, not whole files —
     use read_file afterward if the user then wants full file content.
@@ -110,7 +76,7 @@ def search_content(
     results = []
     needle = query if case_sensitive else query.lower()
 
-    for path in _iter_files():
+    for path in fs.iter_files():
         if not fnmatch.fnmatch(path.name, file_glob):
             continue
         try:
@@ -123,11 +89,11 @@ def search_content(
                         if len(file_matches) >= max_matches_per_file:
                             break
         except (UnicodeDecodeError, PermissionError, OSError):
-            continue  # non-text files
+            continue
 
         if file_matches:
-            results.append({"path": str(path.relative_to(ROOT_DIR)), "matches": file_matches})
-            if len(results) >= _MAX_RESULTS:
+            results.append({"path": str(path.relative_to(fs.ROOT_DIR)), "matches": file_matches})
+            if len(results) >= fs.MAX_RESULTS:
                 break
 
     return results
@@ -142,7 +108,7 @@ def list_directory(relative_path: str = ".") -> dict:
     If the user instead wants files matching a name/type ANYWHERE in the tree, use
     find_by_name or find_by_extension instead — those search recursively, this does not.
     """
-    target = _resolve_within_root(relative_path)
+    target = fs.resolve_within_root(relative_path)
     if target is None:
         return {"error": f"path escapes root directory: {relative_path}"}
     if not target.is_dir():
@@ -150,7 +116,7 @@ def list_directory(relative_path: str = ".") -> dict:
 
     entries = []
     for entry in sorted(target.iterdir()):
-        if entry.name in _SKIP_DIRS:
+        if entry.name in fs.SKIP_DIRS:
             continue
         entries.append({
             "name": entry.name,
@@ -168,7 +134,7 @@ def get_file_info(relative_path: str) -> dict:
     "is X a file or a folder". If the user wants the actual file CONTENT, use read_file instead —
     this tool never returns what's inside the file.
     """
-    target = _resolve_within_root(relative_path)
+    target = fs.resolve_within_root(relative_path)
     if target is None:
         return {"error": f"path escapes root directory: {relative_path}"}
     if not target.exists():
@@ -195,7 +161,7 @@ def find_recently_modified(within_hours: float = 24, file_glob: str = "*") -> li
     """
     cutoff = time.time() - (within_hours * 3600)
     matches = []
-    for path in _iter_files():
+    for path in fs.iter_files():
         if not fnmatch.fnmatch(path.name, file_glob):
             continue
         try:
@@ -204,10 +170,10 @@ def find_recently_modified(within_hours: float = 24, file_glob: str = "*") -> li
             continue
         if mtime >= cutoff:
             matches.append({
-                "path": str(path.relative_to(ROOT_DIR)),
+                "path": str(path.relative_to(fs.ROOT_DIR)),
                 "modified": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(mtime)),
             })
-            if len(matches) >= _MAX_RESULTS:
+            if len(matches) >= fs.MAX_RESULTS:
                 break
     matches.sort(key=lambda m: m["modified"], reverse=True)
     return matches
@@ -225,7 +191,7 @@ def read_file(relative_path: str, max_chars: int = 5000) -> dict:
     for that. Do NOT use this to search across many files for a keyword — use
     search_content for that; this tool only reads one named file at a time.
     """
-    target = _resolve_within_root(relative_path)
+    target = fs.resolve_within_root(relative_path)
     if target is None:
         return {"error": f"path escapes root directory: {relative_path}"}
     if not target.is_file():
@@ -245,8 +211,3 @@ def read_file(relative_path: str, max_chars: int = 5000) -> dict:
         "truncated": truncated,
         "total_chars": len(content),
     }
-
-
-if __name__ == "__main__":
-    print(f"File search server rooted at: {ROOT_DIR}", file=sys.stderr)
-    mcp.run(transport="stdio")
